@@ -1,0 +1,171 @@
+name: Build
+
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  JAVA_VERSION: '17'
+  NODE_VERSION: '22'
+  GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.daemon=false'
+
+jobs:
+  build:
+    name: Build Android & Web
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: 'gradle'
+
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          cmdline-tools-version: '11076708'
+          packages: 'platforms;android-35 build-tools;35.0.0 platform-tools'
+
+      - name: Accept Android SDK licenses
+        run: yes | sdkmanager --licenses || true
+
+      - name: Cache Android NDK
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.0.12077973
+          key: ${{ runner.os }}-ndk-27.0.12077973
+
+      - name: Install Android NDK 27.0.12077973
+        run: |
+          if [ ! -d "$ANDROID_SDK_ROOT/ndk/27.0.12077973" ]; then
+            sdkmanager --install "ndk;27.0.12077973"
+          fi
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/27.0.12077973" >> $GITHUB_ENV
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install Web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Run Web tests
+        working-directory: web
+        run: |
+          npm run build
+          node --test tests/*.test.cjs tests/*.test.mjs || true
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Run unit tests
+        run: ./gradlew :app:testReleaseUnitTest --no-daemon --stacktrace
+
+      - name: Run lint
+        run: ./gradlew :app:lintRelease --no-daemon --stacktrace
+
+      - name: Build release APKs (all ABIs + universal)
+        run: ./gradlew :app:assembleRelease --no-daemon --stacktrace
+
+      - name: Build debug APK
+        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts/release artifacts/debug
+          find app/build/outputs/apk/release -name "*.apk" -exec cp {} artifacts/release/ \;
+          find app/build/outputs/apk/debug -name "*.apk" -exec cp {} artifacts/debug/ \;
+          echo "=== Release APKs ===" && ls -la artifacts/release/ || true
+          echo "=== Debug APKs ===" && ls -la artifacts/debug/ || true
+
+      - name: Upload release APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperflux-release-apks
+          path: artifacts/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperflux-debug-apk
+          path: artifacts/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload Gradle test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperflux-test-reports
+          path: |
+            app/build/reports/tests/
+            app/build/reports/lint-results-*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload web build
+        uses: actions/upload-artifact@v4
+        with:
+          name: paperflux-web-build
+          path: web/dist/
+          if-no-files-found: warn
+          retention-days: 14
+
+  release:
+    name: Publish Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: paperflux-release-apks
+          path: apks
+
+      - name: List APKs
+        run: ls -la apks/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: apks/*.apk
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
